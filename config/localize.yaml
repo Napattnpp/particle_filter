@@ -1,36 +1,97 @@
 particle_filter:
   ros__parameters:
-    # topic names
-    scan_topic: '/scan'
-    odometry_topic: '/odom'
-    # range data downsampling
-    angle_step: 18
-    max_particles: 4000
-    squash_factor: 2.2
-    # visualization
-    viz: 1
-    max_viz_particles: 60
-    # ray marching method
-    range_method: 'rmgpu'
-    theta_discretization: 112
-    # range data filtering
-    max_range: 10
-    fine_timing: 0
-    publish_odom: 1
-    # sensor model constants
-    z_short: 0.01
-    z_max: 0.07
-    z_rand: 0.12
-    z_hit: 0.75
-    sigma_hit: 8.0
-    # motion model dispersion constants
-    motion_dispersion_x: 0.05
-    motion_dispersion_y: 0.025
-    motion_dispersion_theta: 0.25
-    # sensor model variant, variant 2 good for rmgpu, 3 doesn't work for rmgpu
-    rangelib_variant: 2
+    # =========================================================================
+    # 1. Topic and Frame Configurations
+    # =========================================================================
+    scan_topic: '/scan'                  # Topic where 2D LaserScan is published
+    odometry_topic: '/odom'              # Topic where Odometry messages are published
+    publish_odom: 1                      # 1 to publish tracked pose to /pf/pose/odom, 0 to disable
+    global_frame_id: 'map'               # Global coordinate frame (default: 'map')
+    odom_frame_id: 'odom'                # Local odometry frame published by EKF (default: 'odom')
+    base_frame_id: 'base_link'           # Robot base footprint frame (default: 'base_link')
+    laser_frame_id: 'laser'              # LiDAR sensor coordinate frame (default: 'laser')
+
+    # =========================================================================
+    # 2. Particle Filter Core Sizes
+    # =========================================================================
+    max_particles: 4000                  # Total number of particles. Higher number = better accuracy but more CPU/GPU load.
+    squash_factor: 2.2                   # Normalization scaling factor for weights. Prevents early particle convergence.
+                                         # (Tune: Decrease if the cloud collapses too fast; increase if filter reacts slowly).
+
+    # =========================================================================
+    # 3. Ray Casting & range_libc Configurations
+    # =========================================================================
+    range_method: 'rmgpu'                # Options: 'bl' (Bresenham's Line), 'cddt' (CDDT), 'pcddt', 'rm' (Ray Marching), 'rmgpu' (GPU Ray Marching)
+                                         # Note: 'rmgpu' is highly recommended for Jetson platforms.
+    rangelib_variant: 2                  # RangeLib variant. Variant 2 is optimal for GPU ray marching ('rmgpu').
+    theta_discretization: 112            # Number of angular bins for ray matching. Leave at 112 for standard performance.
+    max_range: 10                        # Max LiDAR range in meters to evaluate. Matches physical scanner limit.
+    angle_step: 18                       # Downsample step size for scan rays. Evaluating every N-th ray saves computation.
+                                         # (Tune: Increase step size if GPU/CPU usage is too high; decrease for more precision).
+
+    # =========================================================================
+    # 4. Sensor Model (Scan Likelihood)
+    # =========================================================================
+    # Total probability sum must be 1.0 (z_short + z_max + z_rand + z_hit)
+    z_hit: 0.75                          # Probability of a correct sensor reading matching the map walls
+    z_short: 0.01                        # Probability of short readings (e.g. dynamic obstacles/noise)
+    z_max: 0.07                          # Probability of erroneous maximum range measurements
+    z_rand: 0.12                         # Probability of purely random noise/spikes
+    sigma_hit: 8.0                       # Measurement noise dispersion around hit walls (higher = more tolerant to minor map errors)
+
+    # =========================================================================
+    # 5. Motion Model Selection
+    # =========================================================================
+    motion_model: 'arc'                  # Options:
+                                         #   'default' - Standard coordinate displacement + Gaussian noise
+                                         #   'arc'     - SynPF perturbed arc-based kinematics with side-slip coupling
+
+    # =========================================================================
+    # 6. Default Motion Model Parameters (Used only if motion_model is 'default')
+    # =========================================================================
+    motion_dispersion_x: 0.05            # Standard deviation of noise along local X axis (forward/backward)
+    motion_dispersion_y: 0.025           # Standard deviation of noise along local Y axis (sideways sliding)
+    motion_dispersion_theta: 0.25        # Standard deviation of noise on orientation
+
+    # =========================================================================
+    # 7. SynPF Arc Motion Model Parameters (Used only if motion_model is 'arc')
+    # =========================================================================
+    motion_dispersion_arc_x: 0.05        # Noise coefficient scaled by forward displacement (dx)
+    motion_dispersion_arc_y: 0.025       # Noise coefficient scaled by lateral displacement (dy)
+    motion_dispersion_arc_theta: 0.25    # Noise coefficient scaled by orientation change (dtheta)
+    motion_dispersion_arc_xy: 0.0        # Extra side-slip coupling noise added to Y axis at high speeds
+    motion_dispersion_arc_x_min: 0.01    # Minimum noise boundary for X axis (prevents convergence when stationary)
+    motion_dispersion_arc_y_min: 0.01    # Minimum noise boundary for Y axis (prevents convergence when stationary)
+    motion_dispersion_arc_y_max: 0.01    # Maximum capped noise for Y axis (limits random sideways drift)
+    motion_dispersion_arc_theta_min: 0.01 # Minimum noise boundary for orientation (theta)
+    motion_dispersion_arc_xy_min_x: 0.01 # Forward speed/displacement threshold before side-slip coupling triggers
+                                         # (Tune: Set higher to avoid false slip noise on slow curves; lower for tight fast racing)
+
+    # =========================================================================
+    # 8. Kidnapped Robot / Recovery Configurations
+    # =========================================================================
+    enable_recovery: true                # Set true to enable AMCL-style self-recovery when localized pose is lost
+    recovery_alpha_slow: 0.001           # Slow running average weight filter. (Tune: Controls global baseline convergence rate)
+    recovery_alpha_fast: 0.1             # Fast running average weight filter. (Tune: Controls sensitivity to immediate tracking loss)
+    recovery_max_fraction: 0.05          # Max percentage of particles replaced per frame during recovery (e.g. 0.05 = 5%).
+                                         # (Tune: Decrease to prevent particle cloud scattering; increase to snap back faster)
+
+    # =========================================================================
+    # 9. Resampling & Map Boundary Parameters
+    # =========================================================================
+    ess_threshold_ratio: 0.5             # Threshold ratio for Effective Sample Size (ESS). Resampling triggers only when ESS < ess_threshold_ratio * max_particles.
+                                         # (Tune: Increase to resample more frequently; set to 1.0 to force resampling every update; lower to preserve particle diversity when well-localized).
+    out_of_map_penalty: 0.01             # Multiplier penalty applied to weights of particles that slip outside the permissible map track.
+                                         # (Tune: Lower values kill out-of-bounds particles faster; set to 0.0 to eliminate them immediately).
+
+    # =========================================================================
+    # 10. Diagnostics & Visualization
+    # =========================================================================
+    viz: 1                               # 1 to enable visualization, 0 to disable (saves bandwidth/processing)
+    max_viz_particles: 60                # Max particle markers sent to RViz to avoid rendering latency
+    fine_timing: 0                       # 1 to print detailed profiling metrics to terminal logs
 
 map_server:
   ros__parameters:
-    # assuming map file is in particle_filter/maps
+    # Assuming map file is located in particle_filter/maps
     map: 'levine'

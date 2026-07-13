@@ -23,6 +23,7 @@
 # ros2 python
 import rclpy
 from rclpy.node import Node
+from rcl_interfaces.msg import SetParametersResult
 
 # libraries
 import numpy as np
@@ -83,8 +84,28 @@ class ParticleFiler(Node):
         self.declare_parameter('motion_dispersion_x')
         self.declare_parameter('motion_dispersion_y')
         self.declare_parameter('motion_dispersion_theta')
+        self.declare_parameter('motion_model')
+        self.declare_parameter('motion_dispersion_arc_x')
+        self.declare_parameter('motion_dispersion_arc_y')
+        self.declare_parameter('motion_dispersion_arc_theta')
+        self.declare_parameter('motion_dispersion_arc_xy')
+        self.declare_parameter('motion_dispersion_arc_x_min')
+        self.declare_parameter('motion_dispersion_arc_y_min')
+        self.declare_parameter('motion_dispersion_arc_y_max')
+        self.declare_parameter('motion_dispersion_arc_theta_min')
+        self.declare_parameter('motion_dispersion_arc_xy_min_x')
+        self.declare_parameter('enable_recovery')
+        self.declare_parameter('recovery_alpha_slow')
+        self.declare_parameter('recovery_alpha_fast')
+        self.declare_parameter('recovery_max_fraction')
         self.declare_parameter('scan_topic')
         self.declare_parameter('odometry_topic')
+        self.declare_parameter('ess_threshold_ratio', 0.5)
+        self.declare_parameter('out_of_map_penalty', 0.01)
+        self.declare_parameter('global_frame_id', 'map')
+        self.declare_parameter('odom_frame_id', 'odom')
+        self.declare_parameter('base_frame_id', 'base_link')
+        self.declare_parameter('laser_frame_id', 'laser')
 
         # parameters
         self.ANGLE_STEP           = self.get_parameter('angle_step').value
@@ -107,9 +128,33 @@ class ParticleFiler(Node):
         self.SIGMA_HIT = self.get_parameter('sigma_hit').value
 
         # motion model constants
+        self.MOTION_MODEL            = self.get_parameter('motion_model').value
         self.MOTION_DISPERSION_X     = self.get_parameter('motion_dispersion_x').value
         self.MOTION_DISPERSION_Y     = self.get_parameter('motion_dispersion_y').value
         self.MOTION_DISPERSION_THETA = self.get_parameter('motion_dispersion_theta').value
+        self.MOTION_DISPERSION_ARC_X = self.get_parameter('motion_dispersion_arc_x').value
+        self.MOTION_DISPERSION_ARC_Y = self.get_parameter('motion_dispersion_arc_y').value
+        self.MOTION_DISPERSION_ARC_THETA = self.get_parameter('motion_dispersion_arc_theta').value
+        self.MOTION_DISPERSION_ARC_XY = self.get_parameter('motion_dispersion_arc_xy').value
+        self.MOTION_DISPERSION_ARC_X_MIN = self.get_parameter('motion_dispersion_arc_x_min').value
+        self.MOTION_DISPERSION_ARC_Y_MIN = self.get_parameter('motion_dispersion_arc_y_min').value
+        self.MOTION_DISPERSION_ARC_Y_MAX = self.get_parameter('motion_dispersion_arc_y_max').value
+        self.MOTION_DISPERSION_ARC_THETA_MIN = self.get_parameter('motion_dispersion_arc_theta_min').value
+        self.MOTION_DISPERSION_ARC_XY_MIN_X = self.get_parameter('motion_dispersion_arc_xy_min_x').value
+
+        # recovery system constants
+        self.ENABLE_RECOVERY = self.get_parameter('enable_recovery').value
+        self.RECOVERY_ALPHA_SLOW = self.get_parameter('recovery_alpha_slow').value
+        self.RECOVERY_ALPHA_FAST = self.get_parameter('recovery_alpha_fast').value
+        self.RECOVERY_MAX_FRACTION = self.get_parameter('recovery_max_fraction').value
+        self.ESS_THRESHOLD_RATIO = self.get_parameter('ess_threshold_ratio').value
+        self.OUT_OF_MAP_PENALTY = self.get_parameter('out_of_map_penalty').value
+        self.GLOBAL_FRAME_ID = self.get_parameter('global_frame_id').value
+        self.ODOM_FRAME_ID = self.get_parameter('odom_frame_id').value
+        self.BASE_FRAME_ID = self.get_parameter('base_frame_id').value
+        self.LASER_FRAME_ID = self.get_parameter('laser_frame_id').value
+        self.w_slow = 0.0
+        self.w_fast = 0.0
         
         # various data containers used in the MCL algorithm
         self.MAX_RANGE_PX = None
@@ -152,6 +197,9 @@ class ParticleFiler(Node):
         self.get_omap()
         self.precompute_sensor_model()
         self.initialize_global()
+
+        # parameter callback for dynamic tuning
+        self.add_on_set_parameters_callback(self.parameters_callback)
 
         # keep track of speed from input odom
         self.current_speed = 0.0
@@ -240,16 +288,27 @@ class ParticleFiler(Node):
         if stamp == None:
             stamp = self.get_clock().now().to_msg()
 
+        if self.last_pose is None:
+            return
+
+        # Compute map -> odom transform
+        x_m, y_m, theta_m = pose
+        x_o, y_o, theta_o = self.last_pose
+
+        theta_mo = theta_m - theta_o
+        x_mo = x_m - x_o * np.cos(theta_mo) + y_o * np.sin(theta_mo)
+        y_mo = y_m - x_o * np.sin(theta_mo) - y_o * np.cos(theta_mo)
+
         t = TransformStamped()
         # header
         t.header.stamp = stamp
-        t.header.frame_id = '/map'
-        t.child_frame_id = '/laser'
+        t.header.frame_id = self.GLOBAL_FRAME_ID
+        t.child_frame_id = self.ODOM_FRAME_ID
         # translation
-        t.transform.translation.x = pose[0]
-        t.transform.translation.y = pose[1]
+        t.transform.translation.x = x_mo
+        t.transform.translation.y = y_mo
         t.transform.translation.z = 0.0
-        q = tf_transformations.quaternion_from_euler(0., 0., pose[2])
+        q = tf_transformations.quaternion_from_euler(0., 0., theta_mo)
         # rotation
         t.transform.rotation.x = q[0]
         t.transform.rotation.y = q[1]
@@ -260,12 +319,36 @@ class ParticleFiler(Node):
         if self.PUBLISH_ODOM:
             odom = Odometry()
             odom.header.stamp = self.get_clock().now().to_msg()
-            odom.header.frame_id = '/map'
+            odom.header.frame_id = self.GLOBAL_FRAME_ID
+            odom.child_frame_id = self.BASE_FRAME_ID
             odom.pose.pose.position.x = pose[0]
             odom.pose.pose.position.y = pose[1]
             odom.pose.pose.orientation = Utils.angle_to_quaternion(pose[2])
-            cov_mat = np.cov(self.particles, rowvar=False, ddof=0, aweights=self.weights).flatten()
-            odom.pose.covariance[:cov_mat.shape[0]] = cov_mat
+            # Calculate 3x3 covariance matrix (x, y, theta) using circular statistics for yaw
+            spread = self.particles - self.inferred_pose
+            spread[:, 2] = np.arctan2(np.sin(spread[:, 2]), np.cos(spread[:, 2]))
+            spread_weighted = spread * self.weights[:, np.newaxis]
+            cov_mat = np.dot(spread_weighted.T, spread)
+            
+            # Map 3D state covariance to 6D state covariance (6x6 matrix)
+            ros_cov = np.zeros(36)
+            
+            # Row 0 (X): indices 0 (X), 1 (Y), 5 (Yaw)
+            ros_cov[0] = cov_mat[0, 0] # var(x)
+            ros_cov[1] = cov_mat[0, 1] # cov(x, y)
+            ros_cov[5] = cov_mat[0, 2] # cov(x, yaw)
+            
+            # Row 1 (Y): indices 6 (X), 7 (Y), 11 (Yaw)
+            ros_cov[6] = cov_mat[1, 0] # cov(y, x)
+            ros_cov[7] = cov_mat[1, 1] # var(y)
+            ros_cov[11] = cov_mat[1, 2] # cov(y, yaw)
+            
+            # Row 5 (Yaw): indices 30 (X), 31 (Y), 35 (Yaw)
+            ros_cov[30] = cov_mat[2, 0] # cov(yaw, x)
+            ros_cov[31] = cov_mat[2, 1] # cov(yaw, y)
+            ros_cov[35] = cov_mat[2, 2] # var(yaw)
+            
+            odom.pose.covariance = ros_cov
             odom.twist.twist.linear.x = self.current_speed
             self.odom_pub.publish(odom)
         
@@ -282,7 +365,7 @@ class ParticleFiler(Node):
             # Publish the inferred pose for visualization
             ps = PoseStamped()
             ps.header.stamp = self.get_clock().now().to_msg()
-            ps.header.frame_id = '/map'
+            ps.header.frame_id = self.GLOBAL_FRAME_ID
             ps.pose.position.x = self.inferred_pose[0]
             ps.pose.position.y = self.inferred_pose[1]
             ps.pose.orientation = Utils.angle_to_quaternion(self.inferred_pose[2])
@@ -310,7 +393,7 @@ class ParticleFiler(Node):
         # publish the given particles as a PoseArray object
         pa = PoseArray()
         pa.header.stamp = self.get_clock().now().to_msg()
-        pa.header.frame_id = '/map'
+        pa.header.frame_id = self.GLOBAL_FRAME_ID
         pa.poses = Utils.particles_to_poses(particles)
         self.particle_pub.publish(pa)
 
@@ -318,7 +401,7 @@ class ParticleFiler(Node):
         # publish the given angels and ranges as a laser scan message
         ls = LaserScan()
         ls.header.stamp = self.last_stamp
-        ls.header.frame_id = '/laser'
+        ls.header.frame_id = self.LASER_FRAME_ID
         ls.angle_min = np.min(angles)
         ls.angle_max = np.max(angles)
         ls.angle_increment = np.abs(angles[0] - angles[1])
@@ -382,20 +465,36 @@ class ParticleFiler(Node):
         if isinstance(msg, PointStamped):
             self.initialize_global()
         elif isinstance(msg, PoseWithCovarianceStamped):
-            self.initialize_particles_pose(msg.pose.pose)
+            self.initialize_particles_pose(msg.pose.pose, msg.pose.covariance)
 
-    def initialize_particles_pose(self, pose):
+    def initialize_particles_pose(self, pose, covariance=None):
         '''
         Initialize particles in the general region of the provided pose.
         '''
         self.get_logger().info('SETTING POSE')
         self.get_logger().info(str([pose.position.x, pose.position.y]))
-        self.state_lock.acquire()
-        self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
-        self.particles[:,0] = pose.position.x + np.random.normal(loc=0.0,scale=0.5,size=self.MAX_PARTICLES)
-        self.particles[:,1] = pose.position.y + np.random.normal(loc=0.0,scale=0.5,size=self.MAX_PARTICLES)
-        self.particles[:,2] = Utils.quaternion_to_angle(pose.orientation) + np.random.normal(loc=0.0,scale=0.4,size=self.MAX_PARTICLES)
-        self.state_lock.release()
+        
+        # Default standard deviations (fallbacks if covariance is zero/empty)
+        x_std = 0.5
+        y_std = 0.5
+        yaw_std = 0.4
+        
+        if covariance is not None and len(covariance) == 36:
+            x_var = covariance[0]
+            y_var = covariance[7]
+            yaw_var = covariance[35]
+            if x_var > 1e-4:
+                x_std = np.sqrt(x_var)
+            if y_var > 1e-4:
+                y_std = np.sqrt(y_var)
+            if yaw_var > 1e-4:
+                yaw_std = np.sqrt(yaw_var)
+
+        with self.state_lock:
+            self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
+            self.particles[:,0] = pose.position.x + np.random.normal(loc=0.0, scale=x_std, size=self.MAX_PARTICLES)
+            self.particles[:,1] = pose.position.y + np.random.normal(loc=0.0, scale=y_std, size=self.MAX_PARTICLES)
+            self.particles[:,2] = Utils.quaternion_to_angle(pose.orientation) + np.random.normal(loc=0.0, scale=yaw_std, size=self.MAX_PARTICLES)
 
     def initialize_global(self):
         '''
@@ -403,19 +502,18 @@ class ParticleFiler(Node):
         '''
         self.get_logger().info('GLOBAL INITIALIZATION')
         # randomize over grid coordinate space
-        self.state_lock.acquire()
-        permissible_x, permissible_y = np.where(self.permissible_region == 1)
-        indices = np.random.randint(0, len(permissible_x), size=self.MAX_PARTICLES)
+        with self.state_lock:
+            permissible_x, permissible_y = np.where(self.permissible_region == 1)
+            indices = np.random.randint(0, len(permissible_x), size=self.MAX_PARTICLES)
 
-        permissible_states = np.zeros((self.MAX_PARTICLES,3))
-        permissible_states[:,0] = permissible_y[indices]
-        permissible_states[:,1] = permissible_x[indices]
-        permissible_states[:,2] = np.random.random(self.MAX_PARTICLES) * np.pi * 2.0
+            permissible_states = np.zeros((self.MAX_PARTICLES,3))
+            permissible_states[:,0] = permissible_y[indices]
+            permissible_states[:,1] = permissible_x[indices]
+            permissible_states[:,2] = np.random.random(self.MAX_PARTICLES) * np.pi * 2.0
 
-        Utils.map_to_world(permissible_states, self.map_info)
-        self.particles = permissible_states
-        self.weights[:] = 1.0 / self.MAX_PARTICLES
-        self.state_lock.release()
+            Utils.map_to_world(permissible_states, self.map_info)
+            self.particles = permissible_states
+            self.weights[:] = 1.0 / self.MAX_PARTICLES
 
     def precompute_sensor_model(self):
         '''
@@ -470,32 +568,117 @@ class ParticleFiler(Node):
         if self.RANGELIB_VAR > 0:
             self.range_method.set_sensor_model(self.sensor_model_table)
 
+    def parameters_callback(self, params):
+        for param in params:
+            if param.name == 'motion_model':
+                self.MOTION_MODEL = param.value
+            elif param.name == 'motion_dispersion_x':
+                self.MOTION_DISPERSION_X = param.value
+            elif param.name == 'motion_dispersion_y':
+                self.MOTION_DISPERSION_Y = param.value
+            elif param.name == 'motion_dispersion_theta':
+                self.MOTION_DISPERSION_THETA = param.value
+            elif param.name == 'motion_dispersion_arc_x':
+                self.MOTION_DISPERSION_ARC_X = param.value
+            elif param.name == 'motion_dispersion_arc_y':
+                self.MOTION_DISPERSION_ARC_Y = param.value
+            elif param.name == 'motion_dispersion_arc_theta':
+                self.MOTION_DISPERSION_ARC_THETA = param.value
+            elif param.name == 'motion_dispersion_arc_xy':
+                self.MOTION_DISPERSION_ARC_XY = param.value
+            elif param.name == 'motion_dispersion_arc_x_min':
+                self.MOTION_DISPERSION_ARC_X_MIN = param.value
+            elif param.name == 'motion_dispersion_arc_y_min':
+                self.MOTION_DISPERSION_ARC_Y_MIN = param.value
+            elif param.name == 'motion_dispersion_arc_y_max':
+                self.MOTION_DISPERSION_ARC_Y_MAX = param.value
+            elif param.name == 'motion_dispersion_arc_theta_min':
+                self.MOTION_DISPERSION_ARC_THETA_MIN = param.value
+            elif param.name == 'motion_dispersion_arc_xy_min_x':
+                self.MOTION_DISPERSION_ARC_XY_MIN_X = param.value
+            elif param.name == 'enable_recovery':
+                self.ENABLE_RECOVERY = param.value
+            elif param.name == 'recovery_alpha_slow':
+                self.RECOVERY_ALPHA_SLOW = param.value
+            elif param.name == 'recovery_alpha_fast':
+                self.RECOVERY_ALPHA_FAST = param.value
+            elif param.name == 'recovery_max_fraction':
+                self.RECOVERY_MAX_FRACTION = param.value
+            elif param.name == 'ess_threshold_ratio':
+                self.ESS_THRESHOLD_RATIO = param.value
+            elif param.name == 'out_of_map_penalty':
+                self.OUT_OF_MAP_PENALTY = param.value
+        return SetParametersResult(successful=True, reason="Parameters updated successfully")
+
     def motion_model(self, proposal_dist, action):
         '''
-        The motion model applies the odometry to the particle distribution. Since there the odometry
-        data is inaccurate, the motion model mixes in gaussian noise to spread out the distribution.
-
-        Vectorized motion model. Computing the motion model over all particles is thousands of times
-        faster than doing it for each particle individually due to vectorization and reduction in
-        function call overhead
-        
-        TODO this could be better, but it works for now
-            - fixed random noise is not very realistic
-            - ackermann model provides bad estimates at high speed
+        The motion model applies the odometry to the particle distribution.
+        Supports both the standard community model (default) and the SynPF arc-based model.
         '''
-        # rotate the action into the coordinate space of each particle
-        # t1 = time.time()
-        cosines = np.cos(proposal_dist[:,2])
-        sines = np.sin(proposal_dist[:,2])
+        if self.MOTION_MODEL == 'arc':
+            dx_, dy_, dtheta_ = action
 
-        self.local_deltas[:,0] = cosines*action[0] - sines*action[1]
-        self.local_deltas[:,1] = sines*action[0] + cosines*action[1]
-        self.local_deltas[:,2] = action[2]
+            scale_x = max(self.MOTION_DISPERSION_ARC_X_MIN, np.abs(dx_) * self.MOTION_DISPERSION_ARC_X)
+            scale_y = np.abs(dy_) * self.MOTION_DISPERSION_ARC_Y
+            # If above threshold add noise from x too
+            if np.abs(dx_) > self.MOTION_DISPERSION_ARC_XY_MIN_X:
+                scale_y += (np.abs(dx_)-self.MOTION_DISPERSION_ARC_XY_MIN_X)*self.MOTION_DISPERSION_ARC_XY
+            scale_y = min(self.MOTION_DISPERSION_ARC_Y_MAX, max(self.MOTION_DISPERSION_ARC_Y_MIN, scale_y))
+            scale_th = max(self.MOTION_DISPERSION_ARC_THETA_MIN, np.abs(dtheta_) * self.MOTION_DISPERSION_ARC_THETA)
 
-        proposal_dist[:,:] += self.local_deltas
-        proposal_dist[:,0] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_X,size=self.MAX_PARTICLES)
-        proposal_dist[:,1] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_Y,size=self.MAX_PARTICLES)
-        proposal_dist[:,2] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_THETA,size=self.MAX_PARTICLES)
+            dx = np.random.normal(loc=dx_, scale=scale_x, size=self.MAX_PARTICLES)
+            dy = np.random.normal(loc=dy_, scale=scale_y, size=self.MAX_PARTICLES)
+            dtheta = np.random.normal(loc=dtheta_, scale=scale_th, size=self.MAX_PARTICLES)
+
+            # Determine which particles are moving straight vs curved
+            straight_mask = np.abs(dtheta) < 1e-6
+            curved_mask = ~straight_mask
+
+            x_ = np.zeros(self.MAX_PARTICLES)
+            y_ = np.zeros(self.MAX_PARTICLES)
+            theta_ = proposal_dist[:, 2] + dtheta
+
+            # Straight motion
+            if np.any(straight_mask):
+                x_[straight_mask] = proposal_dist[straight_mask, 0] + dx[straight_mask] * np.cos(proposal_dist[straight_mask, 2])
+                y_[straight_mask] = proposal_dist[straight_mask, 1] + dx[straight_mask] * np.sin(proposal_dist[straight_mask, 2])
+
+            # Curved motion
+            if np.any(curved_mask):
+                r = dx[curved_mask] / dtheta[curved_mask]
+                angle = (np.pi/2) * np.sign(dtheta[curved_mask])
+                cx = proposal_dist[curved_mask, 0] + r*np.cos(proposal_dist[curved_mask, 2] + angle)
+                cy = proposal_dist[curved_mask, 1] + r*np.sin(proposal_dist[curved_mask, 2] + angle)
+                psi = np.arctan2(proposal_dist[curved_mask, 1]-cy, proposal_dist[curved_mask, 0]-cx)
+                x_[curved_mask] = cx + r*np.cos(psi + dtheta[curved_mask])
+                y_[curved_mask] = cy + r*np.sin(psi + dtheta[curved_mask])
+
+            # Apply lateral slip displacement (dy) for all particles
+            x_ += dy*np.cos(theta_ + np.pi/2)
+            y_ += dy*np.sin(theta_ + np.pi/2)
+
+            proposal_dist[:, 0] = x_
+            proposal_dist[:, 1] = y_
+            proposal_dist[:, 2] = theta_
+
+        else:
+            # rotate the action into the coordinate space of each particle
+            cosines = np.cos(proposal_dist[:,2])
+            sines = np.sin(proposal_dist[:,2])
+
+            self.local_deltas[:,0] = cosines*action[0] - sines*action[1]
+            self.local_deltas[:,1] = sines*action[0] + cosines*action[1]
+            self.local_deltas[:,2] = action[2]
+
+            proposal_dist[:,:] += self.local_deltas
+            proposal_dist[:,0] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_X,size=self.MAX_PARTICLES)
+            proposal_dist[:,1] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_Y,size=self.MAX_PARTICLES)
+            proposal_dist[:,2] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_THETA,size=self.MAX_PARTICLES)
+
+        # clamp angles in proposal distribution around (-pi, pi)
+        proposal_s = np.sin(proposal_dist[:, 2])
+        proposal_c = np.cos(proposal_dist[:, 2])
+        proposal_dist[:, 2] = np.arctan2(proposal_s, proposal_c)
 
     def sensor_model(self, proposal_dist, obs, weights):
         '''
@@ -613,9 +796,66 @@ class ParticleFiler(Node):
         '''
         if self.SHOW_FINE_TIMING:
             t = time.time()
-        # draw the proposal distribution from the old particles
-        proposal_indices = np.random.choice(self.particle_indices, self.MAX_PARTICLES, p=self.weights)
-        proposal_distribution = self.particles[proposal_indices,:]
+
+        # Determine if we should inject random particles for recovery
+        p_inject = 0.0
+        if self.ENABLE_RECOVERY and self.w_slow > 0.0:
+            # Ratio of short-term to long-term average weight
+            p_inject = max(0.0, 1.0 - self.w_fast / self.w_slow)
+
+        num_injected = 0
+        if p_inject > 0.0:
+            # Scale injection count by the probability and the maximum allowed fraction
+            num_injected = int(p_inject * self.RECOVERY_MAX_FRACTION * self.MAX_PARTICLES)
+
+        num_resampled = self.MAX_PARTICLES - num_injected
+
+        # Calculate Effective Sample Size (ESS)
+        ess = 1.0 / max(1e-9, np.sum(self.weights ** 2))
+        resampled = False
+        proposal_distribution = np.zeros((self.MAX_PARTICLES, 3))
+
+        # Only resample if ESS is below threshold or if we are injecting recovery particles
+        if num_resampled > 0:
+            if ess < self.MAX_PARTICLES * self.ESS_THRESHOLD_RATIO or num_injected > 0:
+                resampled = True
+                # Systematic Resampling (Low Variance Resampling)
+                positions = (np.random.random() + np.arange(num_resampled)) / num_resampled
+                cumulative_sum = np.cumsum(self.weights)
+                
+                i, j = 0, 0
+                proposal_indices = np.zeros(num_resampled, dtype=int)
+                while i < num_resampled:
+                    if j >= self.MAX_PARTICLES - 1:
+                        proposal_indices[i] = self.MAX_PARTICLES - 1
+                        i += 1
+                    elif positions[i] < cumulative_sum[j]:
+                        proposal_indices[i] = j
+                        i += 1
+                    else:
+                        j += 1
+                        
+                proposal_distribution[:num_resampled, :] = self.particles[proposal_indices, :]
+                
+                # Reset weights for resampled particles
+                self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
+            else:
+                # ESS is high enough, keep particles and skip resampling
+                proposal_distribution[:num_resampled, :] = self.particles[:num_resampled, :]
+
+        # Inject random recovery particles
+        if num_injected > 0:
+            permissible_x, permissible_y = np.where(self.permissible_region == 1)
+            indices = np.random.randint(0, len(permissible_x), size=num_injected)
+
+            random_states = np.zeros((num_injected, 3))
+            random_states[:, 0] = permissible_y[indices]
+            random_states[:, 1] = permissible_x[indices]
+            random_states[:, 2] = np.random.random(num_injected) * np.pi * 2.0
+
+            Utils.map_to_world(random_states, self.map_info)
+            proposal_distribution[num_resampled:, :] = random_states
+
         if self.SHOW_FINE_TIMING:
             t_propose = time.time()
 
@@ -625,12 +865,43 @@ class ParticleFiler(Node):
             t_motion = time.time()
 
         # compute the sensor model
+        old_weights = np.copy(self.weights) if not resampled else None
+        
         self.sensor_model(proposal_distribution, o, self.weights)
+        
+        if not resampled:
+            self.weights *= old_weights
+
+        # Check for permissible region and downscale weight if a particle goes out of track
+        particles_in_map = np.copy(proposal_distribution)
+        Utils.world_to_map(particles_in_map, self.map_info)
+        limit = self.permissible_region.shape
+        x_coords = np.clip(particles_in_map[:, 0].astype(int), 0, limit[1] - 1)
+        y_coords = np.clip(particles_in_map[:, 1].astype(int), 0, limit[0] - 1)
+        valid_particles = self.permissible_region[y_coords, x_coords]
+        self.weights = np.where(valid_particles == 1, self.weights, self.OUT_OF_MAP_PENALTY * self.weights)
         if self.SHOW_FINE_TIMING:
             t_sensor = time.time()
 
-        # normalize importance weights
-        self.weights /= np.sum(self.weights)
+        # Calculate sum of weights before normalization
+        weight_sum = np.sum(self.weights)
+
+        # Update weight running averages for recovery tracking
+        if self.ENABLE_RECOVERY:
+            w_avg = weight_sum / float(self.MAX_PARTICLES)
+            if self.w_slow == 0.0:
+                self.w_slow = w_avg
+                self.w_fast = w_avg
+            else:
+                self.w_slow += self.RECOVERY_ALPHA_SLOW * (w_avg - self.w_slow)
+                self.w_fast += self.RECOVERY_ALPHA_FAST * (w_avg - self.w_fast)
+
+        # normalize importance weights safely
+        if weight_sum < 1e-9:
+            self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
+        else:
+            self.weights /= weight_sum
+
         if self.SHOW_FINE_TIMING:
             t_norm = time.time()
             t_total = (t_norm - t)/100.0
@@ -644,7 +915,15 @@ class ParticleFiler(Node):
     
     def expected_pose(self):
         # returns the expected value of the pose given the particle distribution
-        return np.dot(self.particles.transpose(), self.weights)
+        # Use circular mean for the heading to avoid mathematical errors near +/- pi
+        x = np.dot(self.particles[:, 0], self.weights)
+        y = np.dot(self.particles[:, 1], self.weights)
+        
+        sin_theta = np.dot(np.sin(self.particles[:, 2]), self.weights)
+        cos_theta = np.dot(np.cos(self.particles[:, 2]), self.weights)
+        theta = np.arctan2(sin_theta, cos_theta)
+        
+        return np.array([x, y, theta])
 
     def update(self):
         '''
@@ -653,10 +932,10 @@ class ParticleFiler(Node):
         Ensures the state is correctly initialized, and acquires the state lock before proceeding.
         '''
         if self.lidar_initialized and self.odom_initialized and self.map_initialized:
-            if self.state_lock.locked():
-                self.get_logger().info('Concurrency error avoided')
-            else:
-                self.state_lock.acquire()
+            if not self.state_lock.acquire(blocking=False):
+                # self.get_logger().info('Concurrency error avoided')
+                return
+            try:
                 self.timer.tick()
                 self.iters += 1
 
@@ -670,19 +949,20 @@ class ParticleFiler(Node):
 
                 # compute the expected value of the robot pose
                 self.inferred_pose = self.expected_pose()
+            finally:
                 self.state_lock.release()
-                t2 = time.time()
+            t2 = time.time()
 
-                # publish transformation frame based on inferred pose
-                self.publish_tf(self.inferred_pose, self.last_stamp)
+            # publish transformation frame based on inferred pose
+            self.publish_tf(self.inferred_pose, self.last_stamp)
 
-                # this is for tracking particle filter speed
-                ips = 1.0 / (t2 - t1)
-                self.smoothing.append(ips)
-                if self.iters % 10 == 0:
-                    self.get_logger().info(str(['iters per sec:', int(self.timer.fps()), ' possible:', int(self.smoothing.mean())]))
+            # this is for tracking particle filter speed
+            ips = 1.0 / (t2 - t1)
+            self.smoothing.append(ips)
+            if self.iters % 10 == 0:
+                self.get_logger().info(str(['iters per sec:', int(self.timer.fps()), ' possible:', int(self.smoothing.mean())]))
 
-                self.visualize()
+            self.visualize()
 
 # import argparse
 # import sys
