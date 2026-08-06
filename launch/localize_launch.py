@@ -41,7 +41,14 @@ def generate_launch_description():
         'localize_config',
         default_value=localize_config,
         description='Localization configs')
-    ld = LaunchDescription([localize_la])
+    
+    map_yaml_path_la = DeclareLaunchArgument(
+        'map_yaml_path',
+        default_value=os.path.join(get_package_share_directory('particle_filter'), 'maps', map_name + '.yaml'),
+        description='Path to the map yaml file'
+    )
+    
+    ld = LaunchDescription([localize_la, map_yaml_path_la])
 
     # nodes
     pf_node = Node(
@@ -54,7 +61,7 @@ def generate_launch_description():
         package='nav2_map_server',
         executable='map_server',
         name='map_server',
-        parameters=[{'yaml_filename': os.path.join(get_package_share_directory('particle_filter'), 'maps', map_name + '.yaml')},
+        parameters=[{'yaml_filename': LaunchConfiguration('map_yaml_path')},
                     {'topic': 'map'},
                     {'frame_id': 'map'},
                     {'output': 'screen'},

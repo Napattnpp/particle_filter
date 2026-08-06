@@ -65,47 +65,50 @@ class ParticleFiler(Node):
         super().__init__('particle_filter')
 
         # declare parameters
-        self.declare_parameter('angle_step')
-        self.declare_parameter('max_particles')
-        self.declare_parameter('max_viz_particles')
-        self.declare_parameter('squash_factor')
-        self.declare_parameter('max_range')
-        self.declare_parameter('theta_discretization')
-        self.declare_parameter('range_method')
-        self.declare_parameter('rangelib_variant')
-        self.declare_parameter('fine_timing')
-        self.declare_parameter('publish_odom')
-        self.declare_parameter('viz')
-        self.declare_parameter('z_short')
-        self.declare_parameter('z_max')
-        self.declare_parameter('z_rand')
-        self.declare_parameter('z_hit')
-        self.declare_parameter('sigma_hit')
-        self.declare_parameter('motion_dispersion_x')
-        self.declare_parameter('motion_dispersion_y')
-        self.declare_parameter('motion_dispersion_theta')
-        self.declare_parameter('motion_model')
-        self.declare_parameter('motion_dispersion_arc_x')
-        self.declare_parameter('motion_dispersion_arc_y')
-        self.declare_parameter('motion_dispersion_arc_theta')
-        self.declare_parameter('motion_dispersion_arc_xy')
-        self.declare_parameter('motion_dispersion_arc_x_min')
-        self.declare_parameter('motion_dispersion_arc_y_min')
-        self.declare_parameter('motion_dispersion_arc_y_max')
-        self.declare_parameter('motion_dispersion_arc_theta_min')
-        self.declare_parameter('motion_dispersion_arc_xy_min_x')
-        self.declare_parameter('enable_recovery')
-        self.declare_parameter('recovery_alpha_slow')
-        self.declare_parameter('recovery_alpha_fast')
-        self.declare_parameter('recovery_max_fraction')
-        self.declare_parameter('scan_topic')
-        self.declare_parameter('odometry_topic')
+        self.declare_parameter('angle_step', 18)
+        self.declare_parameter('max_particles', 4000)
+        self.declare_parameter('max_viz_particles', 60)
+        self.declare_parameter('squash_factor', 2.2)
+        self.declare_parameter('max_range', 10)
+        self.declare_parameter('theta_discretization', 112)
+        self.declare_parameter('range_method', 'rmgpu')
+        self.declare_parameter('rangelib_variant', 2)
+        self.declare_parameter('fine_timing', 0)
+        self.declare_parameter('publish_odom', 1)
+        self.declare_parameter('viz', 1)
+        self.declare_parameter('z_short', 0.01)
+        self.declare_parameter('z_max', 0.07)
+        self.declare_parameter('z_rand', 0.12)
+        self.declare_parameter('z_hit', 0.75)
+        self.declare_parameter('sigma_hit', 8.0)
+        self.declare_parameter('motion_dispersion_x', 0.05)
+        self.declare_parameter('motion_dispersion_y', 0.025)
+        self.declare_parameter('motion_dispersion_theta', 0.25)
+        self.declare_parameter('motion_model', 'arc')
+        self.declare_parameter('motion_dispersion_arc_x', 0.05)
+        self.declare_parameter('motion_dispersion_arc_y', 0.025)
+        self.declare_parameter('motion_dispersion_arc_theta', 0.25)
+        self.declare_parameter('motion_dispersion_arc_xy', 0.0)
+        self.declare_parameter('motion_dispersion_arc_x_min', 0.01)
+        self.declare_parameter('motion_dispersion_arc_y_min', 0.01)
+        self.declare_parameter('motion_dispersion_arc_y_max', 0.01)
+        self.declare_parameter('motion_dispersion_arc_theta_min', 0.01)
+        self.declare_parameter('motion_dispersion_arc_xy_min_x', 0.01)
+        self.declare_parameter('enable_recovery', True)
+        self.declare_parameter('recovery_alpha_slow', 0.001)
+        self.declare_parameter('recovery_alpha_fast', 0.1)
+        self.declare_parameter('recovery_max_fraction', 0.05)
+        self.declare_parameter('scan_topic', '/scan')
+        self.declare_parameter('odometry_topic', '/early_fusion/odom')
         self.declare_parameter('ess_threshold_ratio', 0.5)
         self.declare_parameter('out_of_map_penalty', 0.01)
         self.declare_parameter('global_frame_id', 'map')
         self.declare_parameter('odom_frame_id', 'odom')
         self.declare_parameter('base_frame_id', 'base_link')
         self.declare_parameter('laser_frame_id', 'laser')
+        self.declare_parameter('laser_offset_x', 0.165)
+        self.declare_parameter('laser_offset_y', 0.0)
+        self.declare_parameter('pose_estimation_method', 'mean')
 
         # parameters
         self.ANGLE_STEP           = self.get_parameter('angle_step').value
@@ -119,6 +122,7 @@ class ParticleFiler(Node):
         self.SHOW_FINE_TIMING     = self.get_parameter('fine_timing').value
         self.PUBLISH_ODOM         = self.get_parameter('publish_odom').value
         self.DO_VIZ               = self.get_parameter('viz').value
+        self.POSE_ESTIMATION_METHOD = self.get_parameter('pose_estimation_method').value
 
         # sensor model constants
         self.Z_SHORT   = self.get_parameter('z_short').value
@@ -153,6 +157,8 @@ class ParticleFiler(Node):
         self.ODOM_FRAME_ID = self.get_parameter('odom_frame_id').value
         self.BASE_FRAME_ID = self.get_parameter('base_frame_id').value
         self.LASER_FRAME_ID = self.get_parameter('laser_frame_id').value
+        self.laser_offset_x = self.get_parameter('laser_offset_x').value
+        self.laser_offset_y = self.get_parameter('laser_offset_y').value
         self.w_slow = 0.0
         self.w_fast = 0.0
         
@@ -173,6 +179,7 @@ class ParticleFiler(Node):
         self.last_stamp = None
         self.first_sensor_update = True
         self.state_lock = Lock()
+        self.new_lidar_data = False
 
         # cache this to avoid memory allocation in motion model
         self.local_deltas = np.zeros((self.MAX_PARTICLES, 3))
@@ -192,6 +199,7 @@ class ParticleFiler(Node):
         # initialize the state
         self.smoothing = Utils.CircularArray(10)
         self.timer = Utils.Timer(10)
+        self.pose_reset = False
         # map service client
         self.map_client = self.create_client(GetMap, '/map_server/map')
         self.get_omap()
@@ -216,6 +224,8 @@ class ParticleFiler(Node):
 
         # these topics are for coordinate space things
         self.pub_tf = TransformBroadcaster(self)
+
+        # Laser offset parameters are loaded in parameters section
 
         # these topics are to receive data from the racecar
         self.laser_sub = self.create_subscription(
@@ -423,8 +433,14 @@ class ParticleFiler(Node):
             self.get_logger().info(str(self.downsampled_angles.shape[0]))
 
         # store the necessary scanner information for later processing
-        self.downsampled_ranges = np.array(msg.ranges[::self.ANGLE_STEP])
+        raw_ranges = np.array(msg.ranges[::self.ANGLE_STEP], dtype=np.float32)
+        # Replace NaN and Inf with max range
+        raw_ranges[np.isnan(raw_ranges)] = float(self.MAX_RANGE_METERS)
+        raw_ranges[np.isinf(raw_ranges)] = float(self.MAX_RANGE_METERS)
+        # Clip to [0, max_range]
+        self.downsampled_ranges = np.clip(raw_ranges, 0.0, float(self.MAX_RANGE_METERS))
         self.lidar_initialized = True
+        self.new_lidar_data = True
         # self.update()
 
     def odomCB(self, msg):
@@ -447,7 +463,17 @@ class ParticleFiler(Node):
             delta = np.array([position - self.last_pose[0:2]]).transpose()
             local_delta = (rot*delta).transpose()
             
-            self.odometry_data = np.array([local_delta[0,0], local_delta[0,1], orientation - self.last_pose[2]])
+            dtheta = orientation - self.last_pose[2]
+            dtheta = (dtheta + np.pi) % (2 * np.pi) - np.pi
+
+            # Reject physically impossible EKF jumps (e.g. EKF resets, telemetry glitches)
+            displacement = np.sqrt(local_delta[0,0]**2 + local_delta[0,1]**2)
+            if displacement > 0.5 or abs(dtheta) > 1.0:
+                self.get_logger().warn(f"Ignoring EKF jump: dist={displacement:.3f}m, dtheta={dtheta:.3f}rad")
+                self.last_pose = pose
+                return
+
+            self.odometry_data += np.array([local_delta[0,0], local_delta[0,1], dtheta])
             self.last_pose = pose
             self.last_stamp = msg.header.stamp
             self.odom_initialized = True
@@ -462,6 +488,7 @@ class ParticleFiler(Node):
         '''
         Receive pose messages from RViz and initialize the particle distribution in response.
         '''
+        self.get_logger().info(f"clicked_pose callback triggered! Received message of type: {type(msg)}")
         if isinstance(msg, PointStamped):
             self.initialize_global()
         elif isinstance(msg, PoseWithCovarianceStamped):
@@ -495,6 +522,8 @@ class ParticleFiler(Node):
             self.particles[:,0] = pose.position.x + np.random.normal(loc=0.0, scale=x_std, size=self.MAX_PARTICLES)
             self.particles[:,1] = pose.position.y + np.random.normal(loc=0.0, scale=y_std, size=self.MAX_PARTICLES)
             self.particles[:,2] = Utils.quaternion_to_angle(pose.orientation) + np.random.normal(loc=0.0, scale=yaw_std, size=self.MAX_PARTICLES)
+            self.pose_reset = True
+            self.last_pose = None
 
     def initialize_global(self):
         '''
@@ -514,6 +543,8 @@ class ParticleFiler(Node):
             Utils.map_to_world(permissible_states, self.map_info)
             self.particles = permissible_states
             self.weights[:] = 1.0 / self.MAX_PARTICLES
+            self.pose_reset = True
+            self.last_pose = None
 
     def precompute_sensor_model(self):
         '''
@@ -608,6 +639,8 @@ class ParticleFiler(Node):
                 self.ESS_THRESHOLD_RATIO = param.value
             elif param.name == 'out_of_map_penalty':
                 self.OUT_OF_MAP_PENALTY = param.value
+            elif param.name == 'pose_estimation_method':
+                self.POSE_ESTIMATION_METHOD = param.value
         return SetParametersResult(successful=True, reason="Parameters updated successfully")
 
     def motion_model(self, proposal_dist, action):
@@ -645,13 +678,12 @@ class ParticleFiler(Node):
 
             # Curved motion
             if np.any(curved_mask):
+                theta = proposal_dist[curved_mask, 2]
                 r = dx[curved_mask] / dtheta[curved_mask]
-                angle = (np.pi/2) * np.sign(dtheta[curved_mask])
-                cx = proposal_dist[curved_mask, 0] + r*np.cos(proposal_dist[curved_mask, 2] + angle)
-                cy = proposal_dist[curved_mask, 1] + r*np.sin(proposal_dist[curved_mask, 2] + angle)
-                psi = np.arctan2(proposal_dist[curved_mask, 1]-cy, proposal_dist[curved_mask, 0]-cx)
-                x_[curved_mask] = cx + r*np.cos(psi + dtheta[curved_mask])
-                y_[curved_mask] = cy + r*np.sin(psi + dtheta[curved_mask])
+                cx = proposal_dist[curved_mask, 0] - r * np.sin(theta)
+                cy = proposal_dist[curved_mask, 1] + r * np.cos(theta)
+                x_[curved_mask] = cx + r * np.sin(theta + dtheta[curved_mask])
+                y_[curved_mask] = cy - r * np.cos(theta + dtheta[curved_mask])
 
             # Apply lateral slip displacement (dy) for all particles
             x_ += dy*np.cos(theta_ + np.pi/2)
@@ -707,9 +739,15 @@ class ParticleFiler(Node):
             self.tiled_angles = np.tile(self.downsampled_angles, self.MAX_PARTICLES)
             self.first_sensor_update = False
 
+        # Offset the raycasting queries to the actual LiDAR sensor frame origin
+        theta = proposal_dist[:, 2]
+        queries_pose = np.copy(proposal_dist)
+        queries_pose[:, 0] += self.laser_offset_x * np.cos(theta) - self.laser_offset_y * np.sin(theta)
+        queries_pose[:, 1] += self.laser_offset_x * np.sin(theta) + self.laser_offset_y * np.cos(theta)
+
         if self.RANGELIB_VAR == VAR_RADIAL_CDDT_OPTIMIZATIONS:
             if 'cddt' in self.WHICH_RM:
-                self.queries[:,:] = proposal_dist[:,:]
+                self.queries[:,:] = queries_pose[:,:]
                 self.range_method.calc_range_many_radial_optimized(num_rays, self.downsampled_angles[0], self.downsampled_angles[-1], self.queries, self.ranges)
 
                 # evaluate the sensor model
@@ -719,14 +757,14 @@ class ParticleFiler(Node):
             else:
                 self.get_logger().info('Cannot use radial optimizations with non-CDDT based methods, use rangelib_variant 2')
         elif self.RANGELIB_VAR == VAR_REPEAT_ANGLES_EVAL_SENSOR_ONE_SHOT:
-            self.queries[:,:] = proposal_dist[:,:]
+            self.queries[:,:] = queries_pose[:,:]
             self.range_method.calc_range_repeat_angles_eval_sensor_model(self.queries, self.downsampled_angles, obs, self.weights)
             np.power(self.weights, self.INV_SQUASH_FACTOR, self.weights)
         elif self.RANGELIB_VAR == VAR_REPEAT_ANGLES_EVAL_SENSOR:
             if self.SHOW_FINE_TIMING:
                 t_start = time.time()
             # this version demonstrates what this would look like with coordinate space conversion pushed to rangelib
-            self.queries[:,:] = proposal_dist[:,:]
+            self.queries[:,:] = queries_pose[:,:]
             if self.SHOW_FINE_TIMING:
                 t_init = time.time()
             self.range_method.calc_range_repeat_angles(self.queries, self.downsampled_angles, self.ranges)
@@ -747,9 +785,9 @@ class ParticleFiler(Node):
         elif self.RANGELIB_VAR == VAR_CALC_RANGE_MANY_EVAL_SENSOR:
             # this version demonstrates what this would look like with coordinate space conversion pushed to rangelib
             # this part is inefficient since it requires a lot of effort to construct this redundant array
-            self.queries[:,0] = np.repeat(proposal_dist[:,0], num_rays)
-            self.queries[:,1] = np.repeat(proposal_dist[:,1], num_rays)
-            self.queries[:,2] = np.repeat(proposal_dist[:,2], num_rays)
+            self.queries[:,0] = np.repeat(queries_pose[:,0], num_rays)
+            self.queries[:,1] = np.repeat(queries_pose[:,1], num_rays)
+            self.queries[:,2] = np.repeat(queries_pose[:,2], num_rays)
             self.queries[:,2] += self.tiled_angles
 
             self.range_method.calc_range_many(self.queries, self.ranges)
@@ -759,9 +797,9 @@ class ParticleFiler(Node):
             np.power(self.weights, self.INV_SQUASH_FACTOR, self.weights)
         elif self.RANGELIB_VAR == VAR_NO_EVAL_SENSOR_MODEL:
             # this version directly uses the sensor model in Python, at a significant computational cost
-            self.queries[:,0] = np.repeat(proposal_dist[:,0], num_rays)
-            self.queries[:,1] = np.repeat(proposal_dist[:,1], num_rays)
-            self.queries[:,2] = np.repeat(proposal_dist[:,2], num_rays)
+            self.queries[:,0] = np.repeat(queries_pose[:,0], num_rays)
+            self.queries[:,1] = np.repeat(queries_pose[:,1], num_rays)
+            self.queries[:,2] = np.repeat(queries_pose[:,2], num_rays)
             self.queries[:,2] += self.tiled_angles
 
             # compute the ranges for all the particles in a single functon call
@@ -915,15 +953,45 @@ class ParticleFiler(Node):
     
     def expected_pose(self):
         # returns the expected value of the pose given the particle distribution
-        # Use circular mean for the heading to avoid mathematical errors near +/- pi
-        x = np.dot(self.particles[:, 0], self.weights)
-        y = np.dot(self.particles[:, 1], self.weights)
-        
-        sin_theta = np.dot(np.sin(self.particles[:, 2]), self.weights)
-        cos_theta = np.dot(np.cos(self.particles[:, 2]), self.weights)
-        theta = np.arctan2(sin_theta, cos_theta)
-        
-        return np.array([x, y, theta])
+        if self.POSE_ESTIMATION_METHOD == 'map':
+            # Maximum A Posteriori (single highest-weight particle)
+            max_idx = np.argmax(self.weights)
+            return np.copy(self.particles[max_idx, :])
+
+        elif self.POSE_ESTIMATION_METHOD == 'local_mean':
+            # Local mean around the MAP particle (refines MAP, avoids multi-modal averages)
+            max_idx = np.argmax(self.weights)
+            map_particle = self.particles[max_idx, :]
+
+            # Find particles within 0.5 meters of the MAP particle
+            dx = self.particles[:, 0] - map_particle[0]
+            dy = self.particles[:, 1] - map_particle[1]
+            distances_sq = dx**2 + dy**2
+            in_cluster = distances_sq < 0.5**2
+
+            cluster_weights = self.weights[in_cluster]
+            weight_sum = np.sum(cluster_weights)
+            if weight_sum > 1e-9:
+                cluster_weights /= weight_sum
+                x = np.dot(self.particles[in_cluster, 0], cluster_weights)
+                y = np.dot(self.particles[in_cluster, 1], cluster_weights)
+                sin_theta = np.dot(np.sin(self.particles[in_cluster, 2]), cluster_weights)
+                cos_theta = np.dot(np.cos(self.particles[in_cluster, 2]), cluster_weights)
+                theta = np.arctan2(sin_theta, cos_theta)
+                return np.array([x, y, theta])
+            else:
+                return np.copy(map_particle)
+
+        else: # 'mean' (Weighted average)
+            # Use circular mean for the heading to avoid mathematical errors near +/- pi
+            x = np.dot(self.particles[:, 0], self.weights)
+            y = np.dot(self.particles[:, 1], self.weights)
+
+            sin_theta = np.dot(np.sin(self.particles[:, 2]), self.weights)
+            cos_theta = np.dot(np.cos(self.particles[:, 2]), self.weights)
+            theta = np.arctan2(sin_theta, cos_theta)
+
+            return np.array([x, y, theta])
 
     def update(self):
         '''
@@ -942,13 +1010,28 @@ class ParticleFiler(Node):
                 t1 = time.time()
                 observation = np.copy(self.downsampled_ranges).astype(np.float32)
                 action = np.copy(self.odometry_data)
-                self.odometry_data = np.zeros(3)
+ 
+                # run the MCL update algorithm only if the car has actually moved to prevent stationary drift
+                dx, dy, dtheta = action
+                moved = (np.sqrt(dx**2 + dy**2) > 1e-4) or (abs(dtheta) > 1e-4)
+ 
+                if moved or self.inferred_pose is None or self.pose_reset:
+                    # Reset the accumulated odometry now that we are applying it
+                    self.odometry_data = np.zeros(3)
 
-                # run the MCL update algorithm
-                self.MCL(action, observation)
-
-                # compute the expected value of the robot pose
-                self.inferred_pose = self.expected_pose()
+                    if self.pose_reset:
+                        # Recalculate pose immediately from new particles when clicked/reset
+                        self.inferred_pose = self.expected_pose()
+                        self.pose_reset = False
+                    else:
+                        if self.new_lidar_data:
+                            self.MCL(action, observation)
+                            self.new_lidar_data = False
+                        else:
+                            self.motion_model(self.particles, action)
+ 
+                        # compute the expected value of the robot pose
+                        self.inferred_pose = self.expected_pose()
             finally:
                 self.state_lock.release()
             t2 = time.time()

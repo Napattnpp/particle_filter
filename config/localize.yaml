@@ -4,18 +4,20 @@ particle_filter:
     # 1. Topic and Frame Configurations
     # =========================================================================
     scan_topic: '/scan'                  # Topic where 2D LaserScan is published
-    odometry_topic: '/odom'              # Topic where Odometry messages are published
+    odometry_topic: '/early_fusion/odom' # Topic where Odometry messages are published
     publish_odom: 1                      # 1 to publish tracked pose to /pf/pose/odom, 0 to disable
     global_frame_id: 'map'               # Global coordinate frame (default: 'map')
     odom_frame_id: 'odom'                # Local odometry frame published by EKF (default: 'odom')
     base_frame_id: 'base_link'           # Robot base footprint frame (default: 'base_link')
     laser_frame_id: 'laser'              # LiDAR sensor coordinate frame (default: 'laser')
+    laser_offset_x: 0.165                # Longitudinal offset of LiDAR relative to base_link (meters)
+    laser_offset_y: 0.0                  # Lateral offset of LiDAR relative to base_link (meters)
 
     # =========================================================================
     # 2. Particle Filter Core Sizes
     # =========================================================================
     max_particles: 4000                  # Total number of particles. Higher number = better accuracy but more CPU/GPU load.
-    squash_factor: 2.2                   # Normalization scaling factor for weights. Prevents early particle convergence.
+    squash_factor: 1.0                   # Normalization scaling factor for weights. Prevents early particle convergence.
                                          # (Tune: Decrease if the cloud collapses too fast; increase if filter reacts slowly).
 
     # =========================================================================
@@ -37,7 +39,7 @@ particle_filter:
     z_short: 0.01                        # Probability of short readings (e.g. dynamic obstacles/noise)
     z_max: 0.07                          # Probability of erroneous maximum range measurements
     z_rand: 0.12                         # Probability of purely random noise/spikes
-    sigma_hit: 8.0                       # Measurement noise dispersion around hit walls (higher = more tolerant to minor map errors)
+    sigma_hit: 3.0                       # Measurement noise dispersion around hit walls (higher = more tolerant to minor map errors)
 
     # =========================================================================
     # 5. Motion Model Selection
@@ -70,7 +72,7 @@ particle_filter:
     # =========================================================================
     # 8. Kidnapped Robot / Recovery Configurations
     # =========================================================================
-    enable_recovery: true                # Set true to enable AMCL-style self-recovery when localized pose is lost
+    enable_recovery: false               # Set true to enable AMCL-style self-recovery when localized pose is lost
     recovery_alpha_slow: 0.001           # Slow running average weight filter. (Tune: Controls global baseline convergence rate)
     recovery_alpha_fast: 0.1             # Fast running average weight filter. (Tune: Controls sensitivity to immediate tracking loss)
     recovery_max_fraction: 0.05          # Max percentage of particles replaced per frame during recovery (e.g. 0.05 = 5%).
@@ -79,7 +81,7 @@ particle_filter:
     # =========================================================================
     # 9. Resampling & Map Boundary Parameters
     # =========================================================================
-    ess_threshold_ratio: 0.5             # Threshold ratio for Effective Sample Size (ESS). Resampling triggers only when ESS < ess_threshold_ratio * max_particles.
+    ess_threshold_ratio: 0.9             # Threshold ratio for Effective Sample Size (ESS). Resampling triggers only when ESS < ess_threshold_ratio * max_particles.
                                          # (Tune: Increase to resample more frequently; set to 1.0 to force resampling every update; lower to preserve particle diversity when well-localized).
     out_of_map_penalty: 0.01             # Multiplier penalty applied to weights of particles that slip outside the permissible map track.
                                          # (Tune: Lower values kill out-of-bounds particles faster; set to 0.0 to eliminate them immediately).
@@ -90,6 +92,7 @@ particle_filter:
     viz: 1                               # 1 to enable visualization, 0 to disable (saves bandwidth/processing)
     max_viz_particles: 60                # Max particle markers sent to RViz to avoid rendering latency
     fine_timing: 0                       # 1 to print detailed profiling metrics to terminal logs
+    pose_estimation_method: 'local_mean' # Method to estimate robot pose: 'mean' (weighted average), 'map' (highest weight), or 'local_mean' (mean around MAP)
 
 map_server:
   ros__parameters:
