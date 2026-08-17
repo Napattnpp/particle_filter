@@ -36,7 +36,8 @@ def generate_launch_description():
         'localize.yaml'
     )
     localize_config_dict = yaml.safe_load(open(localize_config, 'r'))
-    map_name = localize_config_dict['map_server']['ros__parameters']['map']
+    map_name = localize_config_dict.get('map_server', {}).get('ros__parameters', {}).get('map', 'map')
+    
     localize_la = DeclareLaunchArgument(
         'localize_config',
         default_value=localize_config,
@@ -47,15 +48,22 @@ def generate_launch_description():
         default_value=os.path.join(get_package_share_directory('particle_filter'), 'maps', map_name + '.yaml'),
         description='Path to the map yaml file'
     )
+
+    use_sim_time_la = DeclareLaunchArgument(
+        'use_sim_time',
+        default_value='false',
+        description='Use simulation (Gym/Gazebo) clock if true'
+    )
     
-    ld = LaunchDescription([localize_la, map_yaml_path_la])
+    ld = LaunchDescription([localize_la, map_yaml_path_la, use_sim_time_la])
 
     # nodes
     pf_node = Node(
         package='particle_filter',
         executable='particle_filter',
         name='particle_filter',
-        parameters=[LaunchConfiguration('localize_config')]
+        parameters=[LaunchConfiguration('localize_config'),
+                    {'use_sim_time': LaunchConfiguration('use_sim_time')}]
     )
     map_server_node = Node(
         package='nav2_map_server',
@@ -65,14 +73,14 @@ def generate_launch_description():
                     {'topic': 'map'},
                     {'frame_id': 'map'},
                     {'output': 'screen'},
-                    {'use_sim_time': True}]
+                    {'use_sim_time': LaunchConfiguration('use_sim_time')}]
     )
     nav_lifecycle_node = Node(
         package='nav2_lifecycle_manager',
         executable='lifecycle_manager',
         name='lifecycle_manager_localization',
         output='screen',
-        parameters=[{'use_sim_time': True},
+        parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')},
                     {'autostart': True},
                     {'node_names': ['map_server']}]
     )

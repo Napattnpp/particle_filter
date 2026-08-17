@@ -24,6 +24,7 @@
 import rclpy
 from rclpy.node import Node
 from rcl_interfaces.msg import SetParametersResult
+from lifecycle_msgs.srv import GetState
 
 # libraries
 import numpy as np
@@ -181,8 +182,13 @@ class ParticleFiler(Node):
         self.state_lock = Lock()
         self.new_lidar_data = False
 
-        # cache this to avoid memory allocation in motion model
-        self.local_deltas = np.zeros((self.MAX_PARTICLES, 3))
+        # cache working buffers to avoid allocation in critical loop
+        self.local_deltas = np.zeros((self.MAX_PARTICLES, 3), dtype=np.float64)
+        self.proposal_distribution = np.zeros((self.MAX_PARTICLES, 3), dtype=np.float64)
+        self.queries_pose = np.zeros((self.MAX_PARTICLES, 3), dtype=np.float32)
+        self.motion_dx = np.zeros(self.MAX_PARTICLES, dtype=np.float64)
+        self.motion_dy = np.zeros(self.MAX_PARTICLES, dtype=np.float64)
+        self.motion_dtheta = np.zeros(self.MAX_PARTICLES, dtype=np.float64)
 
         # cache this for the sensor model computation
         self.queries = None
@@ -193,8 +199,8 @@ class ParticleFiler(Node):
         # particle poses and weights
         self.inferred_pose = None
         self.particle_indices = np.arange(self.MAX_PARTICLES)
-        self.particles = np.zeros((self.MAX_PARTICLES, 3))
-        self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
+        self.particles = np.zeros((self.MAX_PARTICLES, 3), dtype=np.float64)
+        self.weights = np.ones(self.MAX_PARTICLES, dtype=np.float64) / float(self.MAX_PARTICLES)
 
         # initialize the state
         self.smoothing = Utils.CircularArray(10)
@@ -257,12 +263,36 @@ class ParticleFiler(Node):
         RangeLibc method. Also stores a matrix which indicates the permissible region of the map
         '''
 
-        while not self.map_client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Get map service not available, waiting...')
-        req = GetMap.Request()
-        future = self.map_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future)
-        map_msg = future.result().map
+        # Wait for map_server lifecycle node to reach ACTIVE state (id == 3)
+        state_client = self.create_client(GetState, '/map_server/get_state')
+        self.get_logger().info('Waiting for map_server lifecycle node to reach ACTIVE state...')
+        while True:
+            if state_client.wait_for_service(timeout_sec=1.0):
+                req = GetState.Request()
+                future = state_client.call_async(req)
+                rclpy.spin_until_future_complete(self, future)
+                if future.result() is not None:
+                    curr_state = future.result().current_state
+                    if curr_state.id == 3:  # 3 = ACTIVE
+                        self.get_logger().info('map_server is ACTIVE! Requesting map...')
+                        break
+            self.get_logger().info('Waiting for map_server to activate...')
+            time.sleep(0.5)
+
+        map_msg = None
+        while map_msg is None:
+            while not self.map_client.wait_for_service(timeout_sec=1.0):
+                self.get_logger().info('Get map service not available, waiting...')
+            req = GetMap.Request()
+            future = self.map_client.call_async(req)
+            rclpy.spin_until_future_complete(self, future)
+            if future.result() is not None:
+                msg = future.result().map
+                if msg.info.resolution > 1e-6 and msg.info.width > 0 and msg.info.height > 0 and len(msg.data) > 0:
+                    map_msg = msg
+                    break
+            time.sleep(0.5)
+
         self.map_info = map_msg.info
 
         oMap = range_libc.PyOMap(map_msg)
@@ -295,8 +325,7 @@ class ParticleFiler(Node):
 
     def publish_tf(self, pose, stamp=None):
         ''' Publish a tf for the car. This tells ROS where the car is with respect to the map. '''
-        if stamp == None:
-            stamp = self.get_clock().now().to_msg()
+        stamp = self.get_clock().now().to_msg()
 
         if self.last_pose is None:
             return
@@ -651,103 +680,81 @@ class ParticleFiler(Node):
         if self.MOTION_MODEL == 'arc':
             dx_, dy_, dtheta_ = action
 
-            scale_x = max(self.MOTION_DISPERSION_ARC_X_MIN, np.abs(dx_) * self.MOTION_DISPERSION_ARC_X)
-            scale_y = np.abs(dy_) * self.MOTION_DISPERSION_ARC_Y
-            # If above threshold add noise from x too
-            if np.abs(dx_) > self.MOTION_DISPERSION_ARC_XY_MIN_X:
-                scale_y += (np.abs(dx_)-self.MOTION_DISPERSION_ARC_XY_MIN_X)*self.MOTION_DISPERSION_ARC_XY
+            scale_x = max(self.MOTION_DISPERSION_ARC_X_MIN, abs(dx_) * self.MOTION_DISPERSION_ARC_X)
+            scale_y = abs(dy_) * self.MOTION_DISPERSION_ARC_Y
+            if abs(dx_) > self.MOTION_DISPERSION_ARC_XY_MIN_X:
+                scale_y += (abs(dx_) - self.MOTION_DISPERSION_ARC_XY_MIN_X) * self.MOTION_DISPERSION_ARC_XY
             scale_y = min(self.MOTION_DISPERSION_ARC_Y_MAX, max(self.MOTION_DISPERSION_ARC_Y_MIN, scale_y))
-            scale_th = max(self.MOTION_DISPERSION_ARC_THETA_MIN, np.abs(dtheta_) * self.MOTION_DISPERSION_ARC_THETA)
+            scale_th = max(self.MOTION_DISPERSION_ARC_THETA_MIN, abs(dtheta_) * self.MOTION_DISPERSION_ARC_THETA)
 
-            dx = np.random.normal(loc=dx_, scale=scale_x, size=self.MAX_PARTICLES)
-            dy = np.random.normal(loc=dy_, scale=scale_y, size=self.MAX_PARTICLES)
-            dtheta = np.random.normal(loc=dtheta_, scale=scale_th, size=self.MAX_PARTICLES)
+            np.random.normal(loc=dx_, scale=scale_x, size=self.MAX_PARTICLES, out=self.motion_dx)
+            np.random.normal(loc=dy_, scale=scale_y, size=self.MAX_PARTICLES, out=self.motion_dy)
+            np.random.normal(loc=dtheta_, scale=scale_th, size=self.MAX_PARTICLES, out=self.motion_dtheta)
 
-            # Determine which particles are moving straight vs curved
-            straight_mask = np.abs(dtheta) < 1e-6
+            abs_dth = np.abs(self.motion_dtheta)
+            straight_mask = abs_dth < 1e-6
             curved_mask = ~straight_mask
 
-            x_ = np.zeros(self.MAX_PARTICLES)
-            y_ = np.zeros(self.MAX_PARTICLES)
-            theta_ = proposal_dist[:, 2] + dtheta
+            theta = proposal_dist[:, 2]
+            theta_next = theta + self.motion_dtheta
 
-            # Straight motion
-            if np.any(straight_mask):
-                x_[straight_mask] = proposal_dist[straight_mask, 0] + dx[straight_mask] * np.cos(proposal_dist[straight_mask, 2])
-                y_[straight_mask] = proposal_dist[straight_mask, 1] + dx[straight_mask] * np.sin(proposal_dist[straight_mask, 2])
-
-            # Curved motion
             if np.any(curved_mask):
-                theta = proposal_dist[curved_mask, 2]
-                r = dx[curved_mask] / dtheta[curved_mask]
-                cx = proposal_dist[curved_mask, 0] - r * np.sin(theta)
-                cy = proposal_dist[curved_mask, 1] + r * np.cos(theta)
-                x_[curved_mask] = cx + r * np.sin(theta + dtheta[curved_mask])
-                y_[curved_mask] = cy - r * np.cos(theta + dtheta[curved_mask])
+                th_c = theta[curved_mask]
+                dth_c = self.motion_dtheta[curved_mask]
+                r = self.motion_dx[curved_mask] / dth_c
+                cx = proposal_dist[curved_mask, 0] - r * np.sin(th_c)
+                cy = proposal_dist[curved_mask, 1] + r * np.cos(th_c)
+                proposal_dist[curved_mask, 0] = cx + r * np.sin(th_c + dth_c)
+                proposal_dist[curved_mask, 1] = cy - r * np.cos(th_c + dth_c)
 
-            # Apply lateral slip displacement (dy) for all particles
-            x_ += dy*np.cos(theta_ + np.pi/2)
-            y_ += dy*np.sin(theta_ + np.pi/2)
+            if np.any(straight_mask):
+                th_s = theta[straight_mask]
+                proposal_dist[straight_mask, 0] += self.motion_dx[straight_mask] * np.cos(th_s)
+                proposal_dist[straight_mask, 1] += self.motion_dx[straight_mask] * np.sin(th_s)
 
-            proposal_dist[:, 0] = x_
-            proposal_dist[:, 1] = y_
-            proposal_dist[:, 2] = theta_
+            lat_angle = theta_next + (np.pi / 2.0)
+            proposal_dist[:, 0] += self.motion_dy * np.cos(lat_angle)
+            proposal_dist[:, 1] += self.motion_dy * np.sin(lat_angle)
+            proposal_dist[:, 2] = np.arctan2(np.sin(theta_next), np.cos(theta_next))
 
         else:
-            # rotate the action into the coordinate space of each particle
-            cosines = np.cos(proposal_dist[:,2])
-            sines = np.sin(proposal_dist[:,2])
+            cosines = np.cos(proposal_dist[:, 2])
+            sines = np.sin(proposal_dist[:, 2])
 
-            self.local_deltas[:,0] = cosines*action[0] - sines*action[1]
-            self.local_deltas[:,1] = sines*action[0] + cosines*action[1]
-            self.local_deltas[:,2] = action[2]
+            self.local_deltas[:, 0] = cosines * action[0] - sines * action[1]
+            self.local_deltas[:, 1] = sines * action[0] + cosines * action[1]
+            self.local_deltas[:, 2] = action[2]
 
-            proposal_dist[:,:] += self.local_deltas
-            proposal_dist[:,0] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_X,size=self.MAX_PARTICLES)
-            proposal_dist[:,1] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_Y,size=self.MAX_PARTICLES)
-            proposal_dist[:,2] += np.random.normal(loc=0.0,scale=self.MOTION_DISPERSION_THETA,size=self.MAX_PARTICLES)
-
-        # clamp angles in proposal distribution around (-pi, pi)
-        proposal_s = np.sin(proposal_dist[:, 2])
-        proposal_c = np.cos(proposal_dist[:, 2])
-        proposal_dist[:, 2] = np.arctan2(proposal_s, proposal_c)
+            proposal_dist += self.local_deltas
+            proposal_dist[:, 0] += np.random.normal(loc=0.0, scale=self.MOTION_DISPERSION_X, size=self.MAX_PARTICLES)
+            proposal_dist[:, 1] += np.random.normal(loc=0.0, scale=self.MOTION_DISPERSION_Y, size=self.MAX_PARTICLES)
+            proposal_dist[:, 2] += np.random.normal(loc=0.0, scale=self.MOTION_DISPERSION_THETA, size=self.MAX_PARTICLES)
+            proposal_dist[:, 2] = np.arctan2(np.sin(proposal_dist[:, 2]), np.cos(proposal_dist[:, 2]))
 
     def sensor_model(self, proposal_dist, obs, weights):
         '''
-        This function computes a probablistic weight for each particle in the proposal distribution.
-        These weights represent how probable each proposed (x,y,theta) pose is given the measured
-        ranges from the lidar scanner.
-
-        There are 4 different variants using various features of RangeLibc for demonstration purposes.
-        - VAR_REPEAT_ANGLES_EVAL_SENSOR is the most stable, and is very fast.
-        - VAR_NO_EVAL_SENSOR_MODEL directly indexes the precomputed sensor model. This is slow
-                                   but it demonstrates what self.range_method.eval_sensor_model does
-        - VAR_RADIAL_CDDT_OPTIMIZATIONS is only compatible with CDDT or PCDDT, it implments the radial
-                                        optimizations to CDDT which simultaneously performs ray casting
-                                        in two directions, reducing the amount of work by roughly a third
+        This function computes a probabilistic weight for each particle in the proposal distribution.
         '''
-        
         num_rays = self.downsampled_angles.shape[0]
-        # only allocate buffers once to avoid slowness
         if self.first_sensor_update:
             if self.RANGELIB_VAR <= 1:
-                self.queries = np.zeros((num_rays*self.MAX_PARTICLES,3), dtype=np.float32)
+                self.queries = np.zeros((num_rays * self.MAX_PARTICLES, 3), dtype=np.float32)
             else:
-                self.queries = np.zeros((self.MAX_PARTICLES,3), dtype=np.float32)
+                self.queries = np.zeros((self.MAX_PARTICLES, 3), dtype=np.float32)
 
-            self.ranges = np.zeros(num_rays*self.MAX_PARTICLES, dtype=np.float32)
+            self.ranges = np.zeros(num_rays * self.MAX_PARTICLES, dtype=np.float32)
             self.tiled_angles = np.tile(self.downsampled_angles, self.MAX_PARTICLES)
             self.first_sensor_update = False
 
-        # Offset the raycasting queries to the actual LiDAR sensor frame origin
+        # Offset the raycasting queries to the actual LiDAR sensor frame origin into preallocated self.queries_pose
         theta = proposal_dist[:, 2]
-        queries_pose = np.copy(proposal_dist)
-        queries_pose[:, 0] += self.laser_offset_x * np.cos(theta) - self.laser_offset_y * np.sin(theta)
-        queries_pose[:, 1] += self.laser_offset_x * np.sin(theta) + self.laser_offset_y * np.cos(theta)
+        self.queries_pose[:, 0] = proposal_dist[:, 0] + self.laser_offset_x * np.cos(theta) - self.laser_offset_y * np.sin(theta)
+        self.queries_pose[:, 1] = proposal_dist[:, 1] + self.laser_offset_x * np.sin(theta) + self.laser_offset_y * np.cos(theta)
+        self.queries_pose[:, 2] = theta
 
         if self.RANGELIB_VAR == VAR_RADIAL_CDDT_OPTIMIZATIONS:
             if 'cddt' in self.WHICH_RM:
-                self.queries[:,:] = queries_pose[:,:]
+                self.queries[:, :] = self.queries_pose[:, :]
                 self.range_method.calc_range_many_radial_optimized(num_rays, self.downsampled_angles[0], self.downsampled_angles[-1], self.queries, self.ranges)
 
                 # evaluate the sensor model
@@ -757,20 +764,19 @@ class ParticleFiler(Node):
             else:
                 self.get_logger().info('Cannot use radial optimizations with non-CDDT based methods, use rangelib_variant 2')
         elif self.RANGELIB_VAR == VAR_REPEAT_ANGLES_EVAL_SENSOR_ONE_SHOT:
-            self.queries[:,:] = queries_pose[:,:]
+            self.queries[:, :] = self.queries_pose[:, :]
             self.range_method.calc_range_repeat_angles_eval_sensor_model(self.queries, self.downsampled_angles, obs, self.weights)
             np.power(self.weights, self.INV_SQUASH_FACTOR, self.weights)
         elif self.RANGELIB_VAR == VAR_REPEAT_ANGLES_EVAL_SENSOR:
             if self.SHOW_FINE_TIMING:
                 t_start = time.time()
-            # this version demonstrates what this would look like with coordinate space conversion pushed to rangelib
-            self.queries[:,:] = queries_pose[:,:]
+            self.queries[:, :] = self.queries_pose[:, :]
             if self.SHOW_FINE_TIMING:
                 t_init = time.time()
             self.range_method.calc_range_repeat_angles(self.queries, self.downsampled_angles, self.ranges)
             if self.SHOW_FINE_TIMING:
                 t_range = time.time()
-            # evaluate the sensor model on the GPU
+            # evaluate the sensor model
             self.range_method.eval_sensor_model(obs, self.ranges, self.weights, num_rays, self.MAX_PARTICLES)
             if self.SHOW_FINE_TIMING:
                 t_eval = time.time()
@@ -851,32 +857,23 @@ class ParticleFiler(Node):
         # Calculate Effective Sample Size (ESS)
         ess = 1.0 / max(1e-9, np.sum(self.weights ** 2))
         resampled = False
-        proposal_distribution = np.zeros((self.MAX_PARTICLES, 3))
+        proposal_distribution = self.proposal_distribution
 
         # Only resample if ESS is below threshold or if we are injecting recovery particles
         if num_resampled > 0:
             if ess < self.MAX_PARTICLES * self.ESS_THRESHOLD_RATIO or num_injected > 0:
                 resampled = True
-                # Systematic Resampling (Low Variance Resampling)
+                # Vectorized Low Variance Resampling via cumulative distribution search
                 positions = (np.random.random() + np.arange(num_resampled)) / num_resampled
                 cumulative_sum = np.cumsum(self.weights)
                 
-                i, j = 0, 0
-                proposal_indices = np.zeros(num_resampled, dtype=int)
-                while i < num_resampled:
-                    if j >= self.MAX_PARTICLES - 1:
-                        proposal_indices[i] = self.MAX_PARTICLES - 1
-                        i += 1
-                    elif positions[i] < cumulative_sum[j]:
-                        proposal_indices[i] = j
-                        i += 1
-                    else:
-                        j += 1
+                proposal_indices = np.searchsorted(cumulative_sum, positions)
+                np.clip(proposal_indices, 0, self.MAX_PARTICLES - 1, out=proposal_indices)
                         
                 proposal_distribution[:num_resampled, :] = self.particles[proposal_indices, :]
                 
                 # Reset weights for resampled particles
-                self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
+                self.weights.fill(1.0 / float(self.MAX_PARTICLES))
             else:
                 # ESS is high enough, keep particles and skip resampling
                 proposal_distribution[:num_resampled, :] = self.particles[:num_resampled, :]
@@ -886,7 +883,7 @@ class ParticleFiler(Node):
             permissible_x, permissible_y = np.where(self.permissible_region == 1)
             indices = np.random.randint(0, len(permissible_x), size=num_injected)
 
-            random_states = np.zeros((num_injected, 3))
+            random_states = np.zeros((num_injected, 3), dtype=np.float64)
             random_states[:, 0] = permissible_y[indices]
             random_states[:, 1] = permissible_x[indices]
             random_states[:, 2] = np.random.random(num_injected) * np.pi * 2.0
@@ -914,8 +911,8 @@ class ParticleFiler(Node):
         particles_in_map = np.copy(proposal_distribution)
         Utils.world_to_map(particles_in_map, self.map_info)
         limit = self.permissible_region.shape
-        x_coords = np.clip(particles_in_map[:, 0].astype(int), 0, limit[1] - 1)
-        y_coords = np.clip(particles_in_map[:, 1].astype(int), 0, limit[0] - 1)
+        x_coords = np.clip(particles_in_map[:, 0].astype(np.int32), 0, limit[1] - 1)
+        y_coords = np.clip(particles_in_map[:, 1].astype(np.int32), 0, limit[0] - 1)
         valid_particles = self.permissible_region[y_coords, x_coords]
         self.weights = np.where(valid_particles == 1, self.weights, self.OUT_OF_MAP_PENALTY * self.weights)
         if self.SHOW_FINE_TIMING:
@@ -936,7 +933,7 @@ class ParticleFiler(Node):
 
         # normalize importance weights safely
         if weight_sum < 1e-9:
-            self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
+            self.weights.fill(1.0 / float(self.MAX_PARTICLES))
         else:
             self.weights /= weight_sum
 
