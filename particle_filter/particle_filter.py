@@ -687,9 +687,9 @@ class ParticleFiler(Node):
             scale_y = min(self.MOTION_DISPERSION_ARC_Y_MAX, max(self.MOTION_DISPERSION_ARC_Y_MIN, scale_y))
             scale_th = max(self.MOTION_DISPERSION_ARC_THETA_MIN, abs(dtheta_) * self.MOTION_DISPERSION_ARC_THETA)
 
-            np.random.normal(loc=dx_, scale=scale_x, size=self.MAX_PARTICLES, out=self.motion_dx)
-            np.random.normal(loc=dy_, scale=scale_y, size=self.MAX_PARTICLES, out=self.motion_dy)
-            np.random.normal(loc=dtheta_, scale=scale_th, size=self.MAX_PARTICLES, out=self.motion_dtheta)
+            self.motion_dx[:] = np.random.normal(loc=dx_, scale=scale_x, size=self.MAX_PARTICLES)
+            self.motion_dy[:] = np.random.normal(loc=dy_, scale=scale_y, size=self.MAX_PARTICLES)
+            self.motion_dtheta[:] = np.random.normal(loc=dtheta_, scale=scale_th, size=self.MAX_PARTICLES)
 
             abs_dth = np.abs(self.motion_dtheta)
             straight_mask = abs_dth < 1e-6
